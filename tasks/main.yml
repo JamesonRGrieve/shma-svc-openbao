@@ -6,14 +6,199 @@
 - name: Enforce secure defaults in production
   assert:
     that:
-      - not openbao_tls_disable | bool
-      - "'change-me' not in openbao_init_root_token"
-      - "'change-me' not in openbao_recovery_passphrase"
-      - "'change-me' not in openbao_tls_cert"
-      - "'change-me' not in openbao_tls_key"
+      - "{{ not (openbao_tls_disable | bool) }}"
     fail_msg: >-
-      Production deployments require TLS and must not use default secrets.
+      Production deployments require TLS. Set openbao_tls_disable: false.
   when: openbao_production | bool
+
+- name: Ensure TLS assets provided when TLS is enabled
+  assert:
+    that:
+      - "{{ openbao_tls_cert | length > 0 }}"
+      - "{{ openbao_tls_key | length > 0 }}"
+    fail_msg: TLS is enabled but certificate or key material was not provided.
+  when: not openbao_tls_disable | bool
+
+- name: Validate TLS certificate and key material
+  when: not openbao_tls_disable | bool
+  block:
+    - name: Create TLS validation workspace
+      tempfile:
+        state: directory
+        suffix: openbao-tls
+      register: openbao_tls_validation_dir
+
+    - name: Write certificate for validation
+      copy:
+        dest: "{{ openbao_tls_validation_dir.path }}/tls.crt"
+        content: "{{ openbao_tls_cert }}"
+        mode: '0600'
+
+    - name: Write private key for validation
+      copy:
+        dest: "{{ openbao_tls_validation_dir.path }}/tls.key"
+        content: "{{ openbao_tls_key }}"
+        mode: '0600'
+
+    - name: Validate certificate format
+      command: openssl x509 -noout -in "{{ openbao_tls_validation_dir.path }}/tls.crt"
+      changed_when: false
+
+    - name: Validate private key format
+      command: openssl pkey -noout -in "{{ openbao_tls_validation_dir.path }}/tls.key"
+      changed_when: false
+
+    - name: Compare TLS certificate and key material
+      command: >-
+        /bin/sh -c "test \"$(openssl x509 -noout -pubkey -in '{{ openbao_tls_validation_dir.path }}/tls.crt' | openssl sha256)\" = \"$(openssl pkey -pubout -in '{{ openbao_tls_validation_dir.path }}/tls.key' | openssl sha256)\""
+      changed_when: false
+
+    - name: Check certificate expiration window
+      command: >-
+        openssl x509 -checkend {{ openbao_certificate_expiry_warning_days * 86400 }} -noout -in "{{ openbao_tls_validation_dir.path }}/tls.crt"
+      register: openbao_cert_expiry_check
+      failed_when: false
+      changed_when: false
+
+    - name: Warn when certificate expiration is approaching
+      when: openbao_cert_expiry_check.rc != 0
+      debug:
+        msg: >-
+          TLS certificate expires within {{ openbao_certificate_expiry_warning_days }} days; rotate it to avoid outages.
+        warn: true
+
+  always:
+    - name: Remove TLS validation workspace
+      when: openbao_tls_validation_dir is defined
+      file:
+        path: "{{ openbao_tls_validation_dir.path }}"
+        state: absent
+
+- name: Validate recovery passphrase complexity
+  assert:
+    that:
+      - "{{ openbao_recovery_passphrase | length >= 16 }}"
+      - "{{ openbao_recovery_passphrase | regex_search('[A-Z]') is not none }}"
+      - "{{ openbao_recovery_passphrase | regex_search('[a-z]') is not none }}"
+      - "{{ openbao_recovery_passphrase | regex_search('[0-9]') is not none }}"
+      - "{{ openbao_recovery_passphrase | regex_search('[^A-Za-z0-9]') is not none }}"
+    fail_msg: >-
+      OPENBAO_INIT_RECOVERY_PASSPHRASE must be at least 16 characters and include upper, lower, numeric, and special characters.
+
+- name: Warn about insufficient Raft replicas
+  when: (openbao_kubernetes_replicas | int) < 3
+  debug:
+    msg: >-
+      OpenBao Raft deployments require at least 3 replicas for high availability. Increase openbao_kubernetes_replicas for production.
+    warn: true
+
+- name: Derive cluster address host
+  set_fact:
+    openbao_cluster_host: "{{ openbao_cluster_addr | regex_replace('^https?://', '') | regex_replace('/.*$', '') | regex_replace(':.*$', '') }}"
+
+- name: Validate cluster address routability
+  assert:
+    that:
+      - "{{ openbao_cluster_host not in ['127.0.0.1', '0.0.0.0', 'localhost'] }}"
+    fail_msg: >-
+      openbao_cluster_addr must be reachable by peer nodes. Configure a routable address instead of {{ openbao_cluster_host }}.
+
+- name: Validate auto-unseal configuration
+  when: openbao_auto_unseal.method | length > 0
+  assert:
+    that:
+      - "{{ (
+            (openbao_auto_unseal.method == 'aws' and openbao_auto_unseal.region and openbao_auto_unseal.kms_key_id)
+            or (openbao_auto_unseal.method == 'azure' and openbao_auto_unseal.tenant_id and openbao_auto_unseal.client_id and openbao_auto_unseal.client_secret and openbao_auto_unseal.vault_name and openbao_auto_unseal.key_name)
+            or (openbao_auto_unseal.method == 'gcp' and openbao_auto_unseal.project and openbao_auto_unseal.region and openbao_auto_unseal.key_ring and openbao_auto_unseal.crypto_key)
+          ) }}"
+    fail_msg: >-
+      openbao_auto_unseal is enabled but required parameters for method {{ openbao_auto_unseal.method }} are missing.
+
+- name: Ensure service job list is initialized
+  set_fact:
+    service_jobs: "{{ service_jobs | default([]) }}"
+
+- name: Ensure init container list is initialized
+  set_fact:
+    service_init_containers: "{{ service_init_containers | default([]) }}"
+
+- name: Configure Raft join init container
+  when: openbao_raft_join_enabled | bool
+  set_fact:
+    service_init_containers: "{{ service_init_containers + [
+      {
+        'name': 'openbao-raft-join',
+        'image': service_image,
+        'command': ['/bin/sh', '-ec', 'bao operator raft join "$VAULT_LEADER_ADDR" || echo "Raft join already completed"'],
+        'env': [
+          {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
+          {'name': 'VAULT_LEADER_ADDR', 'value': openbao_raft_join_endpoint},
+          {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'}
+        ]
+      }
+    ] }}"
+
+- name: Configure scheduled Raft snapshot job
+  when: openbao_snapshot_settings.enabled | bool
+  block:
+    - name: Validate snapshot job configuration
+      assert:
+        that:
+          - "{{ openbao_snapshot_settings.schedule | length > 0 }}"
+          - "{{ openbao_snapshot_settings.storage_path | length > 0 }}"
+        fail_msg: >-
+          Snapshot automation requires both a cron schedule and storage_path.
+
+    - name: Ensure secure export secret is defined when requested
+      when: openbao_snapshot_settings.secure_export_secret | length == 0
+      debug:
+        msg: >-
+          No secure_export_secret configured for snapshot job; snapshots will remain local to {{ openbao_snapshot_settings.storage_path }}.
+        warn: true
+
+    - name: Append snapshot job definition
+      set_fact:
+        service_jobs: "{{ service_jobs + [
+          {
+            'name': 'openbao-raft-snapshot',
+            'schedule': openbao_snapshot_settings.schedule,
+            'image': openbao_snapshot_settings.job_image,
+            'command': ['bao', 'operator', 'raft', 'snapshot', 'save', '--path', openbao_snapshot_settings.storage_path],
+            'env': [
+              {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
+              {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
+              {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase}
+            ],
+            'retention': openbao_snapshot_settings.retention,
+            'secure_export_secret': openbao_snapshot_settings.secure_export_secret
+          }
+        ] }}"
+
+- name: Validate automated initialization job configuration
+  when: openbao_init_job_enabled | bool
+  assert:
+    that:
+      - "{{ openbao_init_job_secure_store | length > 0 }}"
+    fail_msg: >-
+      openbao_init_job_secure_store must contain a secure storage command to capture initialization output.
+
+- name: Configure automated initialization job
+  when: openbao_init_job_enabled | bool
+  set_fact:
+    service_jobs: "{{ service_jobs + [
+      {
+        'name': 'openbao-initialization',
+        'image': service_image,
+        'command': ['/bin/sh', '-ec', 'bao operator init -format=json | {{ openbao_init_job_secure_store }}'],
+        'env': [
+          {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
+          {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
+          {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase},
+          {'name': 'OPENBAO_SECURE_BACKEND', 'value': openbao_init_job_backend_secret}
+        ]
+      }
+    ] }}"
 
 - name: Determine target runtimes
   vars:
