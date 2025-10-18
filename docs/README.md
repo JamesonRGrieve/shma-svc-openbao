@@ -45,6 +45,7 @@ Queries `/v1/sys/health?standbyok=true&sealedcode=200` to ensure OpenBao API res
 | `openbao_service_port`          | `8200`      | API/UI HTTP(S) port                                         |
 | `openbao_cluster_port`          | `8201`      | Raft cluster communication port                             |
 | `openbao_tls_disable`           | `true`      | Disable TLS for development (set to `false` for production) |
+| `openbao_production`            | `false`     | When `true`, asserts TLS is enabled and secrets are rotated  |
 | `openbao_disable_mlock`         | `true`      | Disable memory locking (required for containers)            |
 | `openbao_enable_ui`             | `true`      | Enable web UI                                               |
 | `openbao_log_level`             | `info`      | Logging verbosity (trace, debug, info, warn, error)         |
@@ -65,6 +66,7 @@ The default HCL configuration uses integrated Raft storage:
 
 ## Production Deployment Considerations
 1. **TLS**: Set `openbao_tls_disable: false` and provide valid certificates via vault
+   - When `openbao_production: true`, the role enforces TLS and rejects default `change-me` secrets
 2. **Initialize**: After first boot, run `bao operator init` to generate root tokens and unseal keys
 3. **Unseal**: OpenBao starts sealed - use `bao operator unseal` with generated keys
 4. **Backup**: The Raft storage path (`/var/lib/openbao/data`) must be included in backup strategies
