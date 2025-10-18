@@ -7,8 +7,10 @@
   assert:
     that:
       - "{{ not (openbao_tls_disable | bool) }}"
+      - "{{ not (openbao_disable_mlock | bool) }}"
+      - "{{ (openbao_kubernetes_replicas | int) >= 3 }}"
     fail_msg: >-
-      Production deployments require TLS. Set openbao_tls_disable: false.
+      Production deployments require TLS, mlock, and at least three replicas. Adjust openbao_tls_disable, openbao_disable_mlock, and openbao_kubernetes_replicas accordingly.
   when: openbao_production | bool
 
 - name: Ensure TLS assets provided when TLS is enabled
@@ -22,58 +24,45 @@
 - name: Validate TLS certificate and key material
   when: not openbao_tls_disable | bool
   block:
-    - name: Create TLS validation workspace
-      tempfile:
-        state: directory
-        suffix: openbao-tls
-      register: openbao_tls_validation_dir
-
-    - name: Write certificate for validation
-      copy:
-        dest: "{{ openbao_tls_validation_dir.path }}/tls.crt"
+    - name: Parse TLS certificate
+      ansible.builtin.openssl_certificate_info:
         content: "{{ openbao_tls_cert }}"
-        mode: '0600'
+      register: openbao_tls_cert_info
 
-    - name: Write private key for validation
-      copy:
-        dest: "{{ openbao_tls_validation_dir.path }}/tls.key"
+    - name: Parse TLS private key
+      ansible.builtin.openssl_privatekey_info:
         content: "{{ openbao_tls_key }}"
-        mode: '0600'
+      register: openbao_tls_key_info
 
-    - name: Validate certificate format
-      command: openssl x509 -noout -in "{{ openbao_tls_validation_dir.path }}/tls.crt"
+    - name: Ensure certificate and key pair match
+      assert:
+        that:
+          - openbao_tls_cert_info.public_key is defined
+          - openbao_tls_key_info.public_key is defined
+          - openbao_tls_cert_info.public_key == openbao_tls_key_info.public_key
+        fail_msg: TLS certificate and key do not share the same public key material.
+
+    - name: Capture current epoch for certificate checks
+      command: date +%s
+      register: openbao_current_epoch
       changed_when: false
 
-    - name: Validate private key format
-      command: openssl pkey -noout -in "{{ openbao_tls_validation_dir.path }}/tls.key"
-      changed_when: false
+    - name: Evaluate certificate expiry window
+      set_fact:
+        openbao_certificate_seconds_remaining: "{{ (openbao_tls_cert_info.not_after_timestamp | int) - (openbao_current_epoch.stdout | int) }}"
 
-    - name: Compare TLS certificate and key material
-      command: >-
-        /bin/sh -c "test \"$(openssl x509 -noout -pubkey -in '{{ openbao_tls_validation_dir.path }}/tls.crt' | openssl sha256)\" = \"$(openssl pkey -pubout -in '{{ openbao_tls_validation_dir.path }}/tls.key' | openssl sha256)\""
-      changed_when: false
+    - name: Enforce minimum certificate validity window
+      assert:
+        that:
+          - openbao_force_certificate_deploy | bool or (openbao_certificate_seconds_remaining | int) >= 604800
+        fail_msg: TLS certificate expires in fewer than 7 days. Rotate the certificate or set openbao_force_certificate_deploy: true.
 
-    - name: Check certificate expiration window
-      command: >-
-        openssl x509 -checkend {{ openbao_certificate_expiry_warning_days * 86400 }} -noout -in "{{ openbao_tls_validation_dir.path }}/tls.crt"
-      register: openbao_cert_expiry_check
-      failed_when: false
-      changed_when: false
-
-    - name: Warn when certificate expiration is approaching
-      when: openbao_cert_expiry_check.rc != 0
+    - name: Warn about upcoming certificate expiration
+      when: (openbao_certificate_seconds_remaining | int) < (openbao_certificate_expiry_warning_days * 86400)
       debug:
         msg: >-
           TLS certificate expires within {{ openbao_certificate_expiry_warning_days }} days; rotate it to avoid outages.
         warn: true
-
-  always:
-    - name: Remove TLS validation workspace
-      when: openbao_tls_validation_dir is defined
-      file:
-        path: "{{ openbao_tls_validation_dir.path }}"
-        state: absent
-
 - name: Validate recovery passphrase complexity
   assert:
     that:
@@ -104,17 +93,52 @@
       openbao_cluster_addr must be reachable by peer nodes. Configure a routable address instead of {{ openbao_cluster_host }}.
 
 - name: Validate auto-unseal configuration
-  when: openbao_auto_unseal.method | length > 0
-  assert:
-    that:
-      - "{{ (
-            (openbao_auto_unseal.method == 'aws' and openbao_auto_unseal.region and openbao_auto_unseal.kms_key_id)
-            or (openbao_auto_unseal.method == 'azure' and openbao_auto_unseal.tenant_id and openbao_auto_unseal.client_id and openbao_auto_unseal.client_secret and openbao_auto_unseal.vault_name and openbao_auto_unseal.key_name)
-            or (openbao_auto_unseal.method == 'gcp' and openbao_auto_unseal.project and openbao_auto_unseal.region and openbao_auto_unseal.key_ring and openbao_auto_unseal.crypto_key)
-          ) }}"
-    fail_msg: >-
-      openbao_auto_unseal is enabled but required parameters for method {{ openbao_auto_unseal.method }} are missing.
+  when: openbao_auto_unseal_method | length > 0
+  block:
+    - name: Assert required auto-unseal parameters are present
+      assert:
+        that:
+          - "{{ (
+                (openbao_auto_unseal_method == 'aws' and openbao_auto_unseal_config.region and openbao_auto_unseal_config.kms_key_id)
+                or (openbao_auto_unseal_method == 'azure' and openbao_auto_unseal_config.tenant_id and openbao_auto_unseal_credentials.client_id and openbao_auto_unseal_credentials.client_secret and openbao_auto_unseal_config.vault_name and openbao_auto_unseal_config.key_name)
+                or (openbao_auto_unseal_method == 'gcp' and openbao_auto_unseal_config.project and openbao_auto_unseal_config.region and openbao_auto_unseal_config.key_ring and openbao_auto_unseal_config.crypto_key)
+              ) }}"
+        fail_msg: >-
+          openbao_auto_unseal_method is set to {{ openbao_auto_unseal_method }} but required configuration or credentials are missing.
 
+    - name: Validate AWS auto-unseal identifiers
+      when: openbao_auto_unseal_method == 'aws'
+      assert:
+        that:
+          - openbao_auto_unseal_config.kms_key_id is match('^arn:aws(-[a-z]+)?:kms:[a-z0-9-]+:\d{12}:key/[0-9a-fA-F-]{36}$')
+        fail_msg: AWS KMS key identifiers must be full ARNs (arn:aws:kms:region:account:key/uuid).
+
+    - name: Validate Azure auto-unseal identifiers
+      when: openbao_auto_unseal_method == 'azure'
+      assert:
+        that:
+          - openbao_auto_unseal_config.vault_name is match('^[a-z0-9-]{3,24}$')
+          - openbao_auto_unseal_config.key_name is match('^[A-Za-z0-9-]+$')
+        fail_msg: Azure Key Vault names must be 3-24 lowercase alphanumeric or hyphen characters; key names must be alphanumeric plus hyphen.
+
+    - name: Validate GCP auto-unseal identifiers
+      when: openbao_auto_unseal_method == 'gcp'
+      assert:
+        that:
+          - openbao_auto_unseal_config.project is match('^[a-z][a-z0-9-]{4,28}[a-z0-9]$')
+          - openbao_auto_unseal_config.key_ring is match('^[a-zA-Z0-9_-]{1,63}$')
+          - openbao_auto_unseal_config.crypto_key is match('^[a-zA-Z0-9_-]{1,63}$')
+        fail_msg: GCP project, key ring, and crypto key names must follow Cloud KMS naming conventions.
+
+    - name: Warn when static auto-unseal credentials are supplied
+      when: >-
+        (openbao_auto_unseal_method == 'aws' and (openbao_auto_unseal_credentials.access_key | length > 0 or openbao_auto_unseal_credentials.secret_key | length > 0))
+        or (openbao_auto_unseal_method == 'azure' and (openbao_auto_unseal_credentials.client_id | length > 0 or openbao_auto_unseal_credentials.client_secret | length > 0))
+        or (openbao_auto_unseal_method == 'gcp' and openbao_auto_unseal_credentials.credentials_json | length > 0)
+      debug:
+        msg: >-
+          Static credentials were provided for auto-unseal. Prefer IAM roles or workload identity federation to avoid storing long-lived secrets in configuration.
+        warn: true
 - name: Ensure service job list is initialized
   set_fact:
     service_jobs: "{{ service_jobs | default([]) }}"
@@ -130,7 +154,7 @@
       {
         'name': 'openbao-raft-join',
         'image': service_image,
-        'command': ['/bin/sh', '-ec', 'bao operator raft join "$VAULT_LEADER_ADDR" || echo "Raft join already completed"'],
+        'command': ['/bin/sh', '-ec', 'set -euo pipefail; rc=0; bao operator raft join \"$VAULT_LEADER_ADDR\" || rc=$?; if [ \"$rc\" -eq 0 ]; then exit 0; elif [ \"$rc\" -eq 2 ]; then echo \"Raft join already completed\"; else exit \"$rc\"; fi'],
         'env': [
           {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
           {'name': 'VAULT_LEADER_ADDR', 'value': openbao_raft_join_endpoint},
@@ -164,42 +188,37 @@
             'name': 'openbao-raft-snapshot',
             'schedule': openbao_snapshot_settings.schedule,
             'image': openbao_snapshot_settings.job_image,
-            'command': ['bao', 'operator', 'raft', 'snapshot', 'save', '--path', openbao_snapshot_settings.storage_path],
-            'env': [
-              {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
-              {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
-              {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase}
-            ],
+            'command': ['/bin/sh', '-ec', 'set -euo pipefail; bao operator raft snapshot save --path {{ openbao_snapshot_settings.storage_path }}; {% if openbao_snapshot_settings.retention | int > 0 %}find {{ openbao_snapshot_settings.storage_path }} -type f -mtime +{{ openbao_snapshot_settings.retention }} -delete{% else %}true{% endif %}'],
+            'env': (
+              [
+                {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
+                {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
+                {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase}
+              ]
+              + ([{'name': 'OPENBAO_SNAPSHOT_EXPORT_SECRET', 'value': openbao_snapshot_settings.secure_export_secret}] if (openbao_snapshot_settings.secure_export_secret | length > 0) else [])
+            ),
             'retention': openbao_snapshot_settings.retention,
             'secure_export_secret': openbao_snapshot_settings.secure_export_secret
           }
         ] }}"
-
 - name: Validate automated initialization job configuration
   when: openbao_init_job_enabled | bool
-  assert:
-    that:
-      - "{{ openbao_init_job_secure_store | length > 0 }}"
-    fail_msg: >-
-      openbao_init_job_secure_store must contain a secure storage command to capture initialization output.
+  block:
+    - name: Ensure secure storage command is provided
+      assert:
+        that:
+          - "{{ openbao_init_job_secure_store | length > 0 }}"
+        fail_msg: >-
+          openbao_init_job_secure_store must contain a secure storage command to capture initialization output.
 
-- name: Configure automated initialization job
-  when: openbao_init_job_enabled | bool
-  set_fact:
-    service_jobs: "{{ service_jobs + [
-      {
-        'name': 'openbao-initialization',
-        'image': service_image,
-        'command': ['/bin/sh', '-ec', 'bao operator init -format=json | {{ openbao_init_job_secure_store }}'],
-        'env': [
-          {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
-          {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
-          {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase},
-          {'name': 'OPENBAO_SECURE_BACKEND', 'value': openbao_init_job_backend_secret}
-        ]
-      }
-    ] }}"
-
+    - name: Validate secure storage command allowlist
+      vars:
+        openbao_init_job_secure_store_command: "{{ (openbao_init_job_secure_store | regex_replace('^[\s;|&]+', '')).split() | first | default('') }}"
+      assert:
+        that:
+          - openbao_init_job_secure_store_command in openbao_init_job_secure_store_allowlist
+        fail_msg: >-
+          openbao_init_job_secure_store must begin with an approved command ({{ openbao_init_job_secure_store_allowlist | join(', ') }}).
 - name: Determine target runtimes
   vars:
     candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"

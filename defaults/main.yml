@@ -71,6 +71,31 @@ service_security:
   pod_security_context:
     runAsNonRoot: true
     fsGroup: 1000
+service_pod_disruption_budget: "{{ (openbao_production | bool) | ternary({'min_available': 2}, {}) }}"
+service_topology_spread_constraints: "{{ (openbao_production | bool) | ternary([
+  {
+    'topologyKey': 'kubernetes.io/hostname',
+    'maxSkew': 1,
+    'whenUnsatisfied': 'DoNotSchedule',
+    'labelSelector': {
+      'matchLabels': {
+        'app': service_name
+      }
+    }
+  }
+], []) }}"
+service_pod_anti_affinity: "{{ (openbao_production | bool) | ternary({
+  'requiredDuringSchedulingIgnoredDuringExecution': [
+    {
+      'topologyKey': 'kubernetes.io/hostname',
+      'labelSelector': {
+        'matchLabels': {
+          'app': service_name
+        }
+      }
+    }
+  ]
+}, {}) }}"
 requires: []
 exports:
   env:
@@ -115,26 +140,25 @@ health:
       - /bin/sh
       - -ec
       - |
+        set -euo pipefail
         response=$(curl -sw '\n%{http_code} %{time_total}' "{{ openbao_health_scheme }}://127.0.0.1:{{ openbao_service_port }}/v1/sys/health?standbyok=true" -o /tmp/health.json)
         code=$(printf '%s' "$response" | tail -n1 | awk '{print $1}')
         observed_latency=$(printf '%s' "$response" | tail -n1 | awk '{print $2}')
+        body=$(printf '%s\n' "$response" | sed '$d')
         test "$code" = "200"
-        OBSERVED_LATENCY="$observed_latency" python3 - <<'PY'
-import json
-import os
-import sys
-
-with open('/tmp/health.json', 'r', encoding='utf-8') as fh:
-    data = json.load(fh)
-
-if data.get('sealed'):
-    sys.exit('OpenBao node is sealed')
-
-threshold = float("{{ openbao_readiness_latency_threshold }}")
-observed = float(os.environ.get('OBSERVED_LATENCY', '0'))
-if observed > threshold:
-    sys.exit(f'Readiness latency {observed:.3f}s exceeds threshold {threshold:.3f}s')
-PY
+        if ! printf '%s' "$body" | jq -e '.sealed == false' >/dev/null; then
+          echo 'OpenBao node is sealed' >&2
+          exit 1
+        fi
+        if ! printf '%s' "$observed_latency" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+          echo 'Readiness latency missing from response' >&2
+          exit 1
+        fi
+        threshold={{ openbao_readiness_latency_threshold }}
+        if ! awk -v lat="$observed_latency" -v threshold="$threshold" 'BEGIN {exit !(lat <= threshold)}'; then
+          printf 'Readiness latency %.3fs exceeds threshold %.3fs\n' "$observed_latency" "$threshold" >&2
+          exit 1
+        fi
     interval: 15s
     timeout: 15s
     retries: 3
@@ -220,23 +244,25 @@ openbao_effective_raft_node_id: >-
     else (lookup('env', 'HOSTNAME') | default(service_name ~ '-0', true))
   }}
 openbao_raft_join_enabled: true
-openbao_raft_join_endpoint: "{{ lookup('env', 'OPENBAO_RAFT_JOIN_ENDPOINT') | default(openbao_api_addr, true) }}"
-openbao_auto_unseal:
-  method: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_METHOD') | default('', true) }}"
+openbao_headless_leader_host: "{{ service_name }}-0.{{ service_name }}-headless.{{ openbao_kubernetes_namespace }}.svc.cluster.local"
+openbao_raft_join_endpoint: "{{ lookup('env', 'OPENBAO_RAFT_JOIN_ENDPOINT') | default(openbao_health_scheme ~ '://' ~ openbao_headless_leader_host ~ ':' ~ (openbao_service_port | string), true) }}"
+openbao_auto_unseal_method: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_METHOD') | default('', true) }}"
+openbao_auto_unseal_config:
   region: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_REGION') | default('', true) }}"
   kms_key_id: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_KMS_KEY_ID') | default('', true) }}"
   endpoint: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_ENDPOINT') | default('', true) }}"
-  access_key: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_ACCESS_KEY') | default('', true) }}"
-  secret_key: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_SECRET_KEY') | default('', true) }}"
   tenant_id: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_TENANT_ID') | default('', true) }}"
-  client_id: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CLIENT_ID') | default('', true) }}"
-  client_secret: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CLIENT_SECRET') | default('', true) }}"
   vault_name: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_VAULT_NAME') | default('', true) }}"
   key_name: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_KEY_NAME') | default('', true) }}"
   key_version: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_KEY_VERSION') | default('', true) }}"
   project: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_PROJECT') | default('', true) }}"
   key_ring: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_KEY_RING') | default('', true) }}"
   crypto_key: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CRYPTO_KEY') | default('', true) }}"
+openbao_auto_unseal_credentials:
+  access_key: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_ACCESS_KEY') | default('', true) }}"
+  secret_key: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_SECRET_KEY') | default('', true) }}"
+  client_id: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CLIENT_ID') | default('', true) }}"
+  client_secret: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CLIENT_SECRET') | default('', true) }}"
   credentials_json: "{{ lookup('env', 'OPENBAO_AUTO_UNSEAL_CREDENTIALS_JSON') | default('', true) }}"
 openbao_snapshot_settings:
   enabled: false
@@ -247,49 +273,71 @@ openbao_snapshot_settings:
   job_image: docker.io/openbao/openbao:2.4.1
 openbao_readiness_latency_threshold: 0.75
 openbao_certificate_expiry_warning_days: 30
+openbao_force_certificate_deploy: false
 openbao_audit_device_type: "{{ lookup('env', 'OPENBAO_AUDIT_TYPE') | default('', true) }}"
 openbao_audit_device_path: "{{ lookup('env', 'OPENBAO_AUDIT_PATH') | default('', true) }}"
 openbao_audit_device_mode: "{{ lookup('env', 'OPENBAO_AUDIT_MODE') | default('0640', true) }}"
 openbao_init_job_enabled: false
 openbao_init_job_backend_secret: "{{ lookup('env', 'OPENBAO_INIT_BACKEND_SECRET') | default('', true) }}"
 openbao_init_job_secure_store: "{{ lookup('env', 'OPENBAO_INIT_SECURE_STORE') | default('', true) }}"
+openbao_init_job_secure_store_allowlist:
+  - sops
+  - vault
+  - kubectl
+service_jobs: "{{ ((openbao_init_job_enabled | bool) | ternary([
+  {
+    'name': 'openbao-initialization',
+    'image': service_image,
+    'command': ['/bin/sh', '-ec', 'set -euo pipefail; bao operator init -format=json | {{ openbao_init_job_secure_store }}'],
+    'env': [
+      {'name': 'VAULT_ADDR', 'value': openbao_api_addr},
+      {'name': 'VAULT_SKIP_VERIFY', 'value': 'true' if (openbao_tls_disable | bool) else 'false'},
+      {'name': 'OPENBAO_RECOVERY_PASSPHRASE', 'value': openbao_recovery_passphrase},
+      {'name': 'OPENBAO_SECURE_BACKEND', 'value': openbao_init_job_backend_secret}
+    ],
+    'completions': 1,
+    'backoff_limit': 0
+  }
+], [])) | to_yaml | from_yaml }}"
 openbao_config_template: |
   storage "raft" {
     path    = "/var/lib/openbao/data"
     node_id = "{{ openbao_effective_raft_node_id }}"
   }
 
-{% if openbao_auto_unseal.method == 'aws' %}
+{% if openbao_auto_unseal_method == 'aws' %}
   seal "awskms" {
-    region     = "{{ openbao_auto_unseal.region }}"
-    kms_key_id = "{{ openbao_auto_unseal.kms_key_id }}"
-{% if openbao_auto_unseal.endpoint %}
-    endpoint   = "{{ openbao_auto_unseal.endpoint }}"
+    region     = "{{ openbao_auto_unseal_config.region }}"
+    kms_key_id = "{{ openbao_auto_unseal_config.kms_key_id }}"
+{% if openbao_auto_unseal_config.endpoint %}
+    endpoint   = "{{ openbao_auto_unseal_config.endpoint }}"
 {% endif %}
-{% if openbao_auto_unseal.access_key %}
-    access_key = "{{ openbao_auto_unseal.access_key }}"
-    secret_key = "{{ openbao_auto_unseal.secret_key }}"
+{% if openbao_auto_unseal_credentials.access_key %}
+    access_key = "{{ openbao_auto_unseal_credentials.access_key }}"
+    secret_key = "{{ openbao_auto_unseal_credentials.secret_key }}"
 {% endif %}
   }
-{% elif openbao_auto_unseal.method == 'azure' %}
+{% elif openbao_auto_unseal_method == 'azure' %}
   seal "azurekeyvault" {
-    tenant_id     = "{{ openbao_auto_unseal.tenant_id }}"
-    client_id     = "{{ openbao_auto_unseal.client_id }}"
-    client_secret = "{{ openbao_auto_unseal.client_secret }}"
-    vault_name    = "{{ openbao_auto_unseal.vault_name }}"
-    key_name      = "{{ openbao_auto_unseal.key_name }}"
-{% if openbao_auto_unseal.key_version %}
-    key_version   = "{{ openbao_auto_unseal.key_version }}"
+    tenant_id  = "{{ openbao_auto_unseal_config.tenant_id }}"
+    vault_name = "{{ openbao_auto_unseal_config.vault_name }}"
+    key_name   = "{{ openbao_auto_unseal_config.key_name }}"
+{% if openbao_auto_unseal_config.key_version %}
+    key_version = "{{ openbao_auto_unseal_config.key_version }}"
+{% endif %}
+{% if openbao_auto_unseal_credentials.client_id %}
+    client_id     = "{{ openbao_auto_unseal_credentials.client_id }}"
+    client_secret = "{{ openbao_auto_unseal_credentials.client_secret }}"
 {% endif %}
   }
-{% elif openbao_auto_unseal.method == 'gcp' %}
+{% elif openbao_auto_unseal_method == 'gcp' %}
   seal "gcpckms" {
-    project     = "{{ openbao_auto_unseal.project }}"
-    region      = "{{ openbao_auto_unseal.region }}"
-    key_ring    = "{{ openbao_auto_unseal.key_ring }}"
-    crypto_key  = "{{ openbao_auto_unseal.crypto_key }}"
-{% if openbao_auto_unseal.credentials_json %}
-    credentials = "{{ openbao_auto_unseal.credentials_json }}"
+    project    = "{{ openbao_auto_unseal_config.project }}"
+    region     = "{{ openbao_auto_unseal_config.region }}"
+    key_ring   = "{{ openbao_auto_unseal_config.key_ring }}"
+    crypto_key = "{{ openbao_auto_unseal_config.crypto_key }}"
+{% if openbao_auto_unseal_credentials.credentials_json %}
+    credentials = "{{ openbao_auto_unseal_credentials.credentials_json }}"
 {% endif %}
   }
 {% endif %}
