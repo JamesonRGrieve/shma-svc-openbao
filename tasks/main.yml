@@ -3,6 +3,18 @@
   include_role:
     name: common.validate_schema
 
+- name: Enforce secure defaults in production
+  assert:
+    that:
+      - not openbao_tls_disable | bool
+      - "'change-me' not in openbao_init_root_token"
+      - "'change-me' not in openbao_recovery_passphrase"
+      - "'change-me' not in openbao_tls_cert"
+      - "'change-me' not in openbao_tls_key"
+    fail_msg: >-
+      Production deployments require TLS and must not use default secrets.
+  when: openbao_production | bool
+
 - name: Determine target runtimes
   vars:
     candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"

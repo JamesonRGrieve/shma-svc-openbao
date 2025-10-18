@@ -165,6 +165,7 @@ openbao_enable_ui: "{{ lookup('env', 'OPENBAO_ENABLE_UI') | default(true, true) 
 openbao_log_level: "{{ lookup('env', 'OPENBAO_LOG_LEVEL') | default('info', true) }}"
 openbao_tls_disable: "{{ lookup('env', 'OPENBAO_TLS_DISABLE') | default(true, true) | bool }}"
 openbao_timezone: "{{ lookup('env', 'OPENBAO_TZ') | default('UTC', true) }}"
+openbao_production: "{{ lookup('env', 'OPENBAO_PRODUCTION') | default(false, true) | bool }}"
 openbao_api_addr: "{{ lookup('env', 'OPENBAO_API_ADDR') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_service_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_service_port | string)), true) }}"
 openbao_cluster_addr: "{{ lookup('env', 'OPENBAO_CLUSTER_ADDR') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_cluster_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_cluster_port | string)), true) }}"
 openbao_external_url: "{{ lookup('env', 'OPENBAO_URL') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_service_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_service_port | string)), true) }}"
