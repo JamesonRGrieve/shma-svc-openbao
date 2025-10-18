@@ -1,0 +1,201 @@
+service_id: openbao
+service_name: openbao
+service_unit_name: openbao
+service_image: docker.io/openbao/openbao:2.4.1
+version: "2.4.1"
+needs_container_runtime: true
+service_ip: "{{ openbao_container_ip }}"
+service_ports:
+  - target: 8200
+    published: {{ openbao_service_port }}
+    protocol: tcp
+service_env:
+  - name: VAULT_API_ADDR
+    value: "{{ openbao_api_addr }}"
+  - name: VAULT_CLUSTER_ADDR
+    value: "{{ openbao_cluster_addr }}"
+  - name: VAULT_RAFT_NODE_ID
+    value: "{{ openbao_raft_node_id }}"
+  - name: VAULT_RAFT_PATH
+    value: /var/lib/openbao/data
+  - name: VAULT_DISABLE_MLOCK
+    value: "{{ openbao_disable_mlock | ternary('true', 'false') }}"
+  - name: VAULT_LOG_LEVEL
+    value: "{{ openbao_log_level }}"
+  - name: VAULT_ENABLE_UI
+    value: "{{ openbao_enable_ui | ternary('true', 'false') }}"
+  - name: OPENBAO_CONFIG_FILE
+    value: /etc/openbao/config.d/server.hcl
+  - name: OPENBAO_TLS_DISABLE
+    value: "{{ openbao_tls_disable | ternary('1', '0') }}"
+  - name: TZ
+    value: "{{ openbao_timezone }}"
+service_volumes:
+  - name: config
+    source: "{{ openbao_config_volume }}"
+    target: /etc/openbao
+    driver: local
+    size: "{{ openbao_config_volume_size_gb }}Gi"
+  - name: data
+    source: "{{ openbao_data_volume }}"
+    target: /var/lib/openbao/data
+    driver: local
+    size: "{{ openbao_data_volume_size_gb }}Gi"
+service_resources:
+  memory_mb: "{{ openbao_container_memory_mb }}"
+  cpu_cores: "{{ openbao_container_cpu_cores }}"
+service_namespace: "{{ openbao_kubernetes_namespace }}"
+service_replicas: "{{ openbao_kubernetes_replicas }}"
+service_container:
+  vmid: "{{ openbao_container_vmid }}"
+  hostname: "{{ service_name }}"
+  ostemplate: "{{ openbao_container_template }}"
+  disk: "{{ openbao_container_storage_gb }}"
+  cores: "{{ openbao_container_cpu_cores }}"
+  memory: "{{ openbao_container_memory_mb }}"
+  swap: "{{ openbao_container_swap_mb }}"
+  bridge: "{{ openbao_container_bridge }}"
+  cidr: "{{ openbao_container_cidr }}"
+  gateway: "{{ openbao_container_gateway }}"
+  interface: "{{ openbao_container_interface }}"
+  onboot: yes
+  unprivileged: yes
+  features: nesting=1,keyctl=1
+service_security:
+  run_as_user: 1000
+  run_as_group: 1000
+  read_only_root_filesystem: false
+  capabilities_drop:
+    - ALL
+  no_new_privileges: true
+requires: []
+exports:
+  env:
+    - name: OPENBAO_ADDR
+      value: "{{ openbao_external_url }}"
+      description: Public API endpoint for clients
+    - name: OPENBAO_API_ADDR
+      value: "{{ openbao_api_addr }}"
+      description: Cluster-internal API address
+    - name: OPENBAO_CLUSTER_ADDR
+      value: "{{ openbao_cluster_addr }}"
+      description: Cluster address for raft peers
+mounts:
+  persistent_volumes:
+    - name: config
+      path: /etc/openbao
+    - name: data
+      path: /var/lib/openbao/data
+  ephemeral_mounts:
+    - name: openbao-run
+      path: /run/openbao
+      apply_to: [docker, podman, proxmox, baremetal]
+      medium: Memory
+      size: 32Mi
+      mode: '0755'
+    - name: openbao-tmp
+      path: /tmp/openbao
+      apply_to: [docker, podman, kubernetes, proxmox, baremetal]
+      medium: Memory
+      size: 64Mi
+health:
+  cmd:
+    - curl
+    - -fsS
+    - "{{ openbao_health_scheme }}://127.0.0.1:{{ openbao_service_port }}/v1/sys/health?standbyok=true&sealedcode=200"
+  interval: 15s
+  timeout: 10s
+  retries: 5
+storage:
+  - name: config
+    path: /etc/openbao
+    size: "{{ openbao_config_volume_size_gb }}G"
+  - name: data
+    path: /var/lib/openbao/data
+    size: "{{ openbao_data_volume_size_gb }}G"
+runtime_templates:
+  proxmox: proxmox.yml.j2
+  docker: docker.yml.j2
+  podman: podman.yml.j2
+  kubernetes: kubernetes.yml.j2
+  baremetal: baremetal.yml.j2
+service_files:
+  - path: "{{ openbao_baremetal_config_path }}"
+    mode: '0600'
+    content: "{{ openbao_config_template }}"
+secrets:
+  env:
+    - name: OPENBAO_INIT_ROOT_TOKEN
+      value: "{{ openbao_init_root_token }}"
+    - name: OPENBAO_INIT_RECOVERY_PASSPHRASE
+      value: "{{ openbao_recovery_passphrase }}"
+  files:
+    - name: openbao-config.hcl
+      target: /etc/openbao/config.d/server.hcl
+      mode: '0600'
+      value: "{{ openbao_config_template }}"
+    - name: openbao-tls.crt
+      target: /etc/openbao/tls/tls.crt
+      mode: '0600'
+      value: "{{ openbao_tls_cert }}"
+    - name: openbao-tls.key
+      target: /etc/openbao/tls/tls.key
+      mode: '0600'
+      value: "{{ openbao_tls_key }}"
+
+openbao_service_port: 8200
+openbao_cluster_port: 8201
+openbao_config_volume: openbao-config
+openbao_data_volume: openbao-data
+openbao_config_volume_size_gb: 2
+openbao_data_volume_size_gb: 20
+openbao_container_vmid: 250
+openbao_container_ip: 192.168.100.16
+openbao_container_gateway: 192.168.100.1
+openbao_container_cidr: 24
+openbao_container_bridge: vmbr0
+openbao_container_interface: eth0
+openbao_container_cpu_cores: 2
+openbao_container_memory_mb: 4096
+openbao_container_swap_mb: 4096
+openbao_container_storage_gb: "{{ openbao_config_volume_size_gb + openbao_data_volume_size_gb }}"
+openbao_container_template: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+openbao_disable_mlock: "{{ lookup('env', 'OPENBAO_DISABLE_MLOCK') | default(true, true) | bool }}"
+openbao_enable_ui: "{{ lookup('env', 'OPENBAO_ENABLE_UI') | default(true, true) | bool }}"
+openbao_log_level: "{{ lookup('env', 'OPENBAO_LOG_LEVEL') | default('info', true) }}"
+openbao_tls_disable: "{{ lookup('env', 'OPENBAO_TLS_DISABLE') | default(true, true) | bool }}"
+openbao_timezone: "{{ lookup('env', 'OPENBAO_TZ') | default('UTC', true) }}"
+openbao_api_addr: "{{ lookup('env', 'OPENBAO_API_ADDR') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_service_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_service_port | string)), true) }}"
+openbao_cluster_addr: "{{ lookup('env', 'OPENBAO_CLUSTER_ADDR') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_cluster_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_cluster_port | string)), true) }}"
+openbao_external_url: "{{ lookup('env', 'OPENBAO_URL') | default((openbao_tls_disable | bool) | ternary('http://' ~ service_ip ~ ':' ~ (openbao_service_port | string), 'https://' ~ service_ip ~ ':' ~ (openbao_service_port | string)), true) }}"
+openbao_health_scheme: "{{ (openbao_tls_disable | bool) | ternary('http', 'https') }}"
+openbao_raft_node_id: "{{ lookup('env', 'OPENBAO_RAFT_NODE_ID') | default('openbao-1', true) }}"
+openbao_init_root_token: "{{ lookup('env', 'OPENBAO_INIT_ROOT_TOKEN') | default('change-me-openbao-root', true) }}"
+openbao_recovery_passphrase: "{{ lookup('env', 'OPENBAO_RECOVERY_PASSPHRASE') | default('change-me-openbao-recovery', true) }}"
+openbao_tls_cert: "{{ lookup('env', 'OPENBAO_TLS_CERT') | default('change-me-openbao-tls-cert', true) }}"
+openbao_tls_key: "{{ lookup('env', 'OPENBAO_TLS_KEY') | default('change-me-openbao-tls-key', true) }}"
+openbao_config_template: |
+  storage "raft" {
+    path    = "/var/lib/openbao/data"
+    node_id = "{{ openbao_raft_node_id }}"
+  }
+
+  listener "tcp" {
+    address         = "0.0.0.0:{{ openbao_service_port }}"
+    cluster_address = "0.0.0.0:{{ openbao_cluster_port }}"
+    tls_disable     = {{ openbao_tls_disable | bool | ternary(1, 0) }}
+{% if not openbao_tls_disable | bool %}
+    tls_cert_file  = "/etc/openbao/tls/tls.crt"
+    tls_key_file   = "/etc/openbao/tls/tls.key"
+{% endif %}
+  }
+
+  api_addr     = "{{ openbao_api_addr }}"
+  cluster_addr = "{{ openbao_cluster_addr }}"
+  disable_mlock = {{ openbao_disable_mlock | bool | ternary("true", "false") }}
+  ui           = {{ openbao_enable_ui | bool | ternary("true", "false") }}
+  log_level    = "{{ openbao_log_level }}"
+
+openbao_baremetal_config_path: "/etc/openbao/config.d/server.hcl"
+openbao_kubernetes_namespace: security
+openbao_kubernetes_replicas: 1
